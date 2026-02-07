@@ -158,6 +158,7 @@ const DEFAULT_OPTIONS: Required<CogLayerControlOptions> = {
   collapsed: true,
   beforeId: "",
   defaultUrl: "",
+  loadDefaultUrl: false,
   defaultBands: "1",
   defaultColormap: "none",
   defaultRescaleMin: 0,
@@ -177,7 +178,10 @@ const DEFAULT_OPTIONS: Required<CogLayerControlOptions> = {
 /**
  * Satellite/raster icon SVG for the COG layer toggle button.
  */
-const COG_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M2 12h20"/><path d="M12 2v20"/><path d="M2 7h5"/><path d="M2 17h5"/><path d="M17 2v5"/><path d="M17 17v5"/></svg>`;
+/**
+ * Satellite/image icon for COG layers - represents raster imagery with a mountain landscape.
+ */
+const COG_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`;
 
 /**
  * A control for adding Cloud Optimized GeoTIFF (COG) layers to the map.
@@ -246,6 +250,20 @@ export class CogLayerControl implements IControl {
     this._handleZoom = () => this._checkZoomVisibility();
     this._map.on("zoom", this._handleZoom);
     this._checkZoomVisibility();
+
+    // Auto-load default URL if specified
+    if (this._options.loadDefaultUrl && this._options.defaultUrl) {
+      const loadLayer = () => {
+        this._addLayer();
+      };
+      // Use 'idle' event for more reliable layer loading - ensures style is fully loaded
+      if (this._map.isStyleLoaded()) {
+        // Small delay to ensure everything is ready
+        setTimeout(loadLayer, 100);
+      } else {
+        this._map.once("idle", loadLayer);
+      }
+    }
 
     return this._container;
   }
