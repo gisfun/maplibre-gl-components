@@ -148,6 +148,7 @@ const DEFAULT_OPTIONS: Required<CogLayerControlOptions> = {
   className: '',
   visible: true,
   collapsed: true,
+  beforeId: '',
   defaultUrl: '',
   defaultBands: '1',
   defaultColormap: 'none',
@@ -550,8 +551,16 @@ export class CogLayerControl implements IControl {
     }
     cmSelect.addEventListener('change', () => {
       this._state.colormap = cmSelect.value as ColormapName | 'none';
+      this._updateColormapPreview();
     });
     cmGroup.appendChild(cmSelect);
+
+    // Colormap preview
+    const cmPreview = document.createElement('div');
+    cmPreview.className = 'maplibre-gl-cog-layer-colormap-preview';
+    cmPreview.id = 'cog-colormap-preview';
+    this._updateColormapPreviewElement(cmPreview);
+    cmGroup.appendChild(cmPreview);
     panel.appendChild(cmGroup);
 
     // Rescale min/max row
@@ -615,6 +624,19 @@ export class CogLayerControl implements IControl {
     sliderRow.appendChild(sliderValue);
     opacityGroup.appendChild(sliderRow);
     panel.appendChild(opacityGroup);
+
+    // Before ID input (for layer ordering)
+    const beforeIdGroup = this._createFormGroup('Before Layer ID (optional)', 'before-id');
+    const beforeIdInput = document.createElement('input');
+    beforeIdInput.type = 'text';
+    beforeIdInput.className = 'maplibre-gl-cog-layer-input';
+    beforeIdInput.placeholder = 'e.g. labels or water';
+    beforeIdInput.value = this._options.beforeId || '';
+    beforeIdInput.addEventListener('input', () => {
+      this._options.beforeId = beforeIdInput.value || '';
+    });
+    beforeIdGroup.appendChild(beforeIdInput);
+    panel.appendChild(beforeIdGroup);
 
     // Buttons — always show Add Layer
     const btns = document.createElement('div');
@@ -708,13 +730,34 @@ export class CogLayerControl implements IControl {
     this._panel.appendChild(status);
   }
 
+  private _updateColormapPreview(): void {
+    const preview = document.getElementById('cog-colormap-preview');
+    if (preview) {
+      this._updateColormapPreviewElement(preview);
+    }
+  }
+
+  private _updateColormapPreviewElement(element: HTMLElement): void {
+    if (this._state.colormap === 'none') {
+      element.style.background = 'linear-gradient(to right, #888, #888)';
+      element.style.display = 'none';
+    } else {
+      const stops = getColormap(this._state.colormap);
+      const colors = stops.map(s => s.color).join(', ');
+      element.style.background = `linear-gradient(to right, ${colors})`;
+      element.style.display = 'block';
+    }
+  }
+
   private async _ensureOverlay(): Promise<void> {
     if (this._deckOverlay) return;
     if (!this._map) return;
 
     const { MapboxOverlay } = await import('@deck.gl/mapbox');
+    // Only use interleaved mode if beforeId is specified (for layer ordering)
+    // interleaved: false is much faster for opacity updates
     this._deckOverlay = new MapboxOverlay({
-      interleaved: false,
+      interleaved: !!this._options.beforeId,
       layers: [],
     });
     (this._map as unknown as { addControl(c: IControl): void }).addControl(this._deckOverlay);
@@ -1034,6 +1077,17 @@ export class CogLayerControl implements IControl {
         _rescaleMin: this._state.rescaleMin,
         _rescaleMax: this._state.rescaleMax,
         _colormap: this._state.colormap,
+        // Add beforeId for layer ordering (only if specified and layer exists)
+        ...((() => {
+          if (this._options.beforeId) {
+            if (map.getLayer(this._options.beforeId)) {
+              return { beforeId: this._options.beforeId };
+            } else {
+              console.warn(`[CogLayerControl] beforeId "${this._options.beforeId}" not found in map layers, adding layer on top`);
+            }
+          }
+          return {};
+        })()),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         onGeoTIFFLoad: (_geotiff: any, options: any) => {
           try {
