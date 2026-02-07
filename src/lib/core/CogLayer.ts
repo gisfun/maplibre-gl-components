@@ -6,35 +6,138 @@ import type {
   CogLayerControlState,
   CogLayerEvent,
   CogLayerEventHandler,
+  CogLayerInfo,
+  ColorStop,
   ColormapName,
 } from './types';
+import { getColormap } from '../colormaps';
 
 /**
- * All available colormap names for the dropdown.
+ * Shader module that rescales float raster values to [0,1] for visualization.
+ * Single-band: maps value from [minVal, maxVal] to grayscale.
+ * Multi-band: rescales each channel independently.
+ */
+const RescaleFloat = {
+  name: 'rescaleFloat',
+  fs: `\
+uniform rescaleFloatUniforms {
+  float minVal;
+  float maxVal;
+  float isSingleBand;
+} rescaleFloat;
+`,
+  inject: {
+    'fs:DECKGL_FILTER_COLOR': /* glsl */ `
+    float range = rescaleFloat.maxVal - rescaleFloat.minVal;
+    if (range > 0.0) {
+      if (rescaleFloat.isSingleBand > 0.5) {
+        float val = clamp((color.r - rescaleFloat.minVal) / range, 0.0, 1.0);
+        color = vec4(val, val, val, 1.0);
+      } else {
+        color.r = clamp((color.r - rescaleFloat.minVal) / range, 0.0, 1.0);
+        color.g = clamp((color.g - rescaleFloat.minVal) / range, 0.0, 1.0);
+        color.b = clamp((color.b - rescaleFloat.minVal) / range, 0.0, 1.0);
+      }
+    }
+    `,
+  },
+  uniformTypes: {
+    minVal: 'f32' as const,
+    maxVal: 'f32' as const,
+    isSingleBand: 'f32' as const,
+  },
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  getUniforms: (props: any) => ({
+    minVal: props.minVal,
+    maxVal: props.maxVal,
+    isSingleBand: props.isSingleBand,
+  }),
+};
+
+/**
+ * Recursively apply opacity to deck.gl sublayers via clone().
+ * COGLayer doesn't propagate opacity to its RasterLayer/PathLayer sublayers,
+ * so this is needed for opacity changes to take visual effect.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function applyOpacity(layers: any, opacity: number): any {
+  if (!layers) return layers;
+  if (Array.isArray(layers)) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return layers.map((layer: any) => applyOpacity(layer, opacity));
+  }
+  if (typeof layers.clone === 'function') {
+    return layers.clone({ opacity });
+  }
+  return layers;
+}
+
+/**
+ * Parse a CSS hex color (#RGB or #RRGGBB) to [r, g, b] values (0-255).
+ */
+function parseHexColor(hex: string): [number, number, number] {
+  let h = hex.replace('#', '');
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+
+/**
+ * Build a 256×1 RGBA ImageData from an array of ColorStops.
+ * Linearly interpolates between stops.
+ */
+function colormapToImageData(stops: ColorStop[]): ImageData {
+  const size = 256;
+  const rgba = new Uint8ClampedArray(size * 4);
+  const parsed = stops.map(s => ({ pos: s.position, rgb: parseHexColor(s.color) }));
+  for (let i = 0; i < size; i++) {
+    const t = i / (size - 1);
+    // Find surrounding stops
+    let lo = parsed[0], hi = parsed[parsed.length - 1];
+    for (let j = 0; j < parsed.length - 1; j++) {
+      if (t >= parsed[j].pos && t <= parsed[j + 1].pos) {
+        lo = parsed[j];
+        hi = parsed[j + 1];
+        break;
+      }
+    }
+    const range = hi.pos - lo.pos;
+    const f = range > 0 ? (t - lo.pos) / range : 0;
+    rgba[i * 4] = lo.rgb[0] + (hi.rgb[0] - lo.rgb[0]) * f;
+    rgba[i * 4 + 1] = lo.rgb[1] + (hi.rgb[1] - lo.rgb[1]) * f;
+    rgba[i * 4 + 2] = lo.rgb[2] + (hi.rgb[2] - lo.rgb[2]) * f;
+    rgba[i * 4 + 3] = 255;
+  }
+  return new ImageData(rgba, size, 1);
+}
+
+/**
+ * All available colormap names for the dropdown (sorted alphabetically, 'none' first).
  */
 const COLORMAP_NAMES: (ColormapName | 'none')[] = [
   'none',
-  'viridis',
-  'plasma',
-  'inferno',
-  'magma',
-  'cividis',
-  'coolwarm',
-  'bwr',
-  'seismic',
-  'RdBu',
-  'RdYlBu',
-  'RdYlGn',
-  'spectral',
-  'jet',
-  'rainbow',
-  'turbo',
-  'terrain',
-  'ocean',
-  'hot',
-  'cool',
-  'gray',
-  'bone',
+  ...([
+    'bone',
+    'bwr',
+    'cividis',
+    'cool',
+    'coolwarm',
+    'gray',
+    'hot',
+    'inferno',
+    'jet',
+    'magma',
+    'ocean',
+    'plasma',
+    'rainbow',
+    'RdBu',
+    'RdYlBu',
+    'RdYlGn',
+    'seismic',
+    'spectral',
+    'terrain',
+    'turbo',
+    'viridis',
+  ] as ColormapName[]),
 ];
 
 /**
@@ -47,7 +150,7 @@ const DEFAULT_OPTIONS: Required<CogLayerControlOptions> = {
   collapsed: true,
   defaultUrl: '',
   defaultBands: '1',
-  defaultColormap: 'viridis',
+  defaultColormap: 'none',
   defaultRescaleMin: 0,
   defaultRescaleMax: 255,
   defaultNodata: 0,
@@ -99,11 +202,10 @@ export class CogLayerControl implements IControl {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private _deckOverlay?: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private _cogLayer?: any;
+  private _cogLayers: Map<string, any> = new Map();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private _COGLayerClass?: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private _cogLayerProps?: Record<string, any>;
+  private _cogLayerPropsMap: Map<string, Record<string, any>> = new Map();
+  private _layerCounter = 0;
 
   constructor(options?: CogLayerControlOptions) {
     this._options = { ...DEFAULT_OPTIONS, ...options };
@@ -118,6 +220,8 @@ export class CogLayerControl implements IControl {
       nodata: this._options.defaultNodata,
       layerOpacity: this._options.defaultOpacity,
       hasLayer: false,
+      layerCount: 0,
+      layers: [],
       loading: false,
       error: null,
       status: null,
@@ -137,7 +241,7 @@ export class CogLayerControl implements IControl {
   }
 
   onRemove(): void {
-    this._removeLayer();
+    this._removeLayer(); // Remove all layers on cleanup
 
     if (this._map && this._handleZoom) {
       this._map.off('zoom', this._handleZoom);
@@ -230,14 +334,14 @@ export class CogLayerControl implements IControl {
   }
 
   /**
-   * Programmatically remove the COG layer.
+   * Programmatically remove a COG layer by ID, or all layers if no ID given.
    */
-  removeLayer(): void {
-    this._removeLayer();
+  removeLayer(id?: string): void {
+    this._removeLayer(id);
     this._render();
   }
 
-  private _emit(event: CogLayerEvent, extra?: { url?: string; error?: string }): void {
+  private _emit(event: CogLayerEvent, extra?: { url?: string; error?: string; layerId?: string }): void {
     const handlers = this._eventHandlers.get(event);
     if (handlers) {
       const payload = { type: event, state: this.getState(), ...extra };
@@ -363,7 +467,7 @@ export class CogLayerControl implements IControl {
     for (const name of COLORMAP_NAMES) {
       const opt = document.createElement('option');
       opt.value = name;
-      opt.textContent = name === 'none' ? 'none (RGB)' : name;
+      opt.textContent = name;
       if (name === this._state.colormap) opt.selected = true;
       cmSelect.appendChild(opt);
     }
@@ -435,34 +539,16 @@ export class CogLayerControl implements IControl {
     opacityGroup.appendChild(sliderRow);
     panel.appendChild(opacityGroup);
 
-    // Buttons
+    // Buttons — always show Add Layer
     const btns = document.createElement('div');
     btns.className = 'maplibre-gl-cog-layer-buttons';
 
-    if (!this._state.hasLayer) {
-      const addBtn = document.createElement('button');
-      addBtn.className = 'maplibre-gl-cog-layer-btn maplibre-gl-cog-layer-btn--primary';
-      addBtn.textContent = 'Add Layer';
-      addBtn.disabled = this._state.loading;
-      addBtn.addEventListener('click', () => this._addLayer());
-      btns.appendChild(addBtn);
-    } else {
-      const updateBtn = document.createElement('button');
-      updateBtn.className = 'maplibre-gl-cog-layer-btn maplibre-gl-cog-layer-btn--primary';
-      updateBtn.textContent = 'Update Layer';
-      updateBtn.disabled = this._state.loading;
-      updateBtn.addEventListener('click', () => this._updateLayer());
-      btns.appendChild(updateBtn);
-
-      const removeBtn = document.createElement('button');
-      removeBtn.className = 'maplibre-gl-cog-layer-btn maplibre-gl-cog-layer-btn--danger';
-      removeBtn.textContent = 'Remove Layer';
-      removeBtn.addEventListener('click', () => {
-        this._removeLayer();
-        this._render();
-      });
-      btns.appendChild(removeBtn);
-    }
+    const addBtn = document.createElement('button');
+    addBtn.className = 'maplibre-gl-cog-layer-btn maplibre-gl-cog-layer-btn--primary';
+    addBtn.textContent = 'Add Layer';
+    addBtn.disabled = this._state.loading;
+    addBtn.addEventListener('click', () => this._addLayer());
+    btns.appendChild(addBtn);
 
     panel.appendChild(btns);
 
@@ -473,6 +559,54 @@ export class CogLayerControl implements IControl {
       this._appendStatus(this._state.error, 'error');
     } else if (this._state.status) {
       this._appendStatus(this._state.status, 'success');
+    }
+
+    // Layer list
+    if (this._cogLayers.size > 0) {
+      const listContainer = document.createElement('div');
+      listContainer.className = 'maplibre-gl-cog-layer-list';
+
+      const listHeader = document.createElement('div');
+      listHeader.className = 'maplibre-gl-cog-layer-list-header';
+      listHeader.textContent = `Layers (${this._cogLayers.size})`;
+      listContainer.appendChild(listHeader);
+
+      for (const [layerId, ] of this._cogLayers) {
+        const props = this._cogLayerPropsMap.get(layerId);
+        if (!props) continue;
+
+        const item = document.createElement('div');
+        item.className = 'maplibre-gl-cog-layer-list-item';
+
+        const label = document.createElement('span');
+        label.className = 'maplibre-gl-cog-layer-list-label';
+        // Extract filename from URL for display
+        const url = props.geotiff as string;
+        let displayName: string;
+        try {
+          const urlObj = new URL(url);
+          displayName = urlObj.pathname.split('/').pop() || url;
+        } catch {
+          displayName = url;
+        }
+        label.textContent = displayName;
+        label.title = url;
+        item.appendChild(label);
+
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'maplibre-gl-cog-layer-list-remove';
+        removeBtn.innerHTML = '&times;';
+        removeBtn.title = 'Remove layer';
+        removeBtn.addEventListener('click', () => {
+          this._removeLayer(layerId);
+          this._render();
+        });
+        item.appendChild(removeBtn);
+
+        listContainer.appendChild(item);
+      }
+
+      panel.appendChild(listContainer);
     }
 
     this._container.appendChild(panel);
@@ -545,6 +679,254 @@ export class CogLayerControl implements IControl {
     };
   }
 
+  /**
+   * Monkey-patch COGLayer._parseGeoTIFF to handle floating-point GeoTIFFs.
+   * The upstream library only supports unsigned integer data (SampleFormat: 1).
+   * This patch catches the "non-unsigned integers not yet supported" error and
+   * re-implements the parsing with a float-compatible render pipeline.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private _patchCOGLayerForFloat(COGLayerClass: any): void {
+    // Guard: only patch once
+    if (COGLayerClass.__floatPatched) return;
+    COGLayerClass.__floatPatched = true;
+
+    const originalParseGeoTIFF = COGLayerClass.prototype._parseGeoTIFF;
+
+    COGLayerClass.prototype._parseGeoTIFF = async function () {
+      try {
+        await originalParseGeoTIFF.call(this);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('non-unsigned integers not yet supported')) {
+          throw err;
+        }
+
+        // Float fallback: re-do the GeoTIFF parsing with a custom pipeline.
+        // We use the public exports from the library plus `geotiff` (transitive dep).
+        const { fromUrl } = await import('geotiff');
+        const { parseCOGTileMatrixSet, texture } = await import(
+          '@developmentseed/deck.gl-geotiff'
+        );
+        const { CreateTexture, FilterNoDataVal } = await import(
+          '@developmentseed/deck.gl-raster/gpu-modules'
+        );
+        const proj4Module = await import('proj4');
+        const proj4Fn = proj4Module.default || proj4Module;
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const geotiffInput = (this as any).props.geotiff;
+        const geotiff = typeof geotiffInput === 'string'
+          ? await fromUrl(geotiffInput)
+          : geotiffInput;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const geoKeysParser = (this as any).props.geoKeysParser;
+        const metadata = await parseCOGTileMatrixSet(geotiff, geoKeysParser);
+
+        const image = await geotiff.getImage();
+        const imageCount = await geotiff.getImageCount();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const images: any[] = [];
+        for (let i = 0; i < imageCount; i++) {
+          images.push(await geotiff.getImage(i));
+        }
+
+        const sourceProjection = await geoKeysParser(image.getGeoKeys());
+        if (!sourceProjection) {
+          throw new Error('Could not determine source projection from GeoTIFF geo keys');
+        }
+        const converter = proj4Fn(sourceProjection.def, 'EPSG:4326');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const forwardReproject = (x: number, y: number) => converter.forward([x, y], false as any);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const inverseReproject = (x: number, y: number) => converter.inverse([x, y], false as any);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        if ((this as any).props.onGeoTIFFLoad) {
+          // Compute geographic bounds for fitBounds callback
+          const bbox = image.getBoundingBox();
+          const corners = [
+            converter.forward([bbox[0], bbox[1]]),
+            converter.forward([bbox[2], bbox[1]]),
+            converter.forward([bbox[2], bbox[3]]),
+            converter.forward([bbox[0], bbox[3]]),
+          ];
+          const lons = corners.map((c: number[]) => c[0]);
+          const lats = corners.map((c: number[]) => c[1]);
+          const geographicBounds = {
+            west: Math.min(...lons),
+            south: Math.min(...lats),
+            east: Math.max(...lons),
+            north: Math.max(...lats),
+          };
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (this as any).props.onGeoTIFFLoad(geotiff, {
+            projection: sourceProjection,
+            geographicBounds,
+          });
+        }
+
+        // Build float-compatible getTileData and renderTile
+        const ifd = image.getFileDirectory();
+        const { BitsPerSample, SampleFormat, SamplesPerPixel, GDAL_NODATA } = ifd;
+
+        // Parse GDAL_NODATA tag (inline, since it's not publicly exported)
+        let noDataVal: number | null = null;
+        if (GDAL_NODATA) {
+          const ndStr = GDAL_NODATA[GDAL_NODATA.length - 1] === '\x00'
+            ? GDAL_NODATA.slice(0, -1)
+            : GDAL_NODATA;
+          if (ndStr.length > 0) noDataVal = parseFloat(ndStr);
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const defaultGetTileData = async (geotiffImage: any, options: any) => {
+          const { device } = options;
+          const rasterData = await geotiffImage.readRasters({
+            ...options,
+            interleave: true,
+          });
+
+          let data = rasterData;
+          let numSamples = SamplesPerPixel;
+
+          // WebGL2 has no RGB-only float format; expand 3-band to RGBA
+          if (SamplesPerPixel === 3) {
+            const pixelCount = rasterData.width * rasterData.height;
+            const rgba = new Float32Array(pixelCount * 4);
+            for (let i = 0; i < pixelCount; i++) {
+              rgba[i * 4] = rasterData[i * 3];
+              rgba[i * 4 + 1] = rasterData[i * 3 + 1];
+              rgba[i * 4 + 2] = rasterData[i * 3 + 2];
+              rgba[i * 4 + 3] = 1.0;
+            }
+            data = rgba;
+            // Preserve dimensions for texture creation
+            (data as { width?: number; height?: number }).width = rasterData.width;
+            (data as { width?: number; height?: number }).height = rasterData.height;
+            numSamples = 4;
+          }
+
+          const textureFormat = texture.inferTextureFormat(numSamples, BitsPerSample, SampleFormat);
+          const tex = device.createTexture({
+            data,
+            format: textureFormat,
+            width: rasterData.width,
+            height: rasterData.height,
+            sampler: { magFilter: 'nearest', minFilter: 'nearest' },
+          });
+
+          return {
+            texture: tex,
+            height: rasterData.height,
+            width: rasterData.width,
+          };
+        };
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const self = this as any;
+        // Cache colormap texture to avoid recreating per tile
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let cachedCmapName: string | null = null;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let cachedCmapTexture: any = null;
+
+        const { Colormap } = await import('@developmentseed/deck.gl-raster/gpu-modules');
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const defaultRenderTile = (tileData: any) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const pipeline: any[] = [
+            {
+              module: CreateTexture,
+              props: { textureName: tileData.texture },
+            },
+          ];
+
+          // Filter nodata pixels
+          if (noDataVal !== null) {
+            pipeline.push({
+              module: FilterNoDataVal,
+              props: { value: noDataVal },
+            });
+          }
+
+          // Rescale float values to [0,1] for visualization
+          const rescaleMin = self.props._rescaleMin ?? 0;
+          const rescaleMax = self.props._rescaleMax ?? 255;
+          pipeline.push({
+            module: RescaleFloat,
+            props: {
+              minVal: rescaleMin,
+              maxVal: rescaleMax,
+              isSingleBand: SamplesPerPixel === 1 ? 1.0 : 0.0,
+            },
+          });
+
+          // Apply colormap if selected
+          const cmapName = self.props._colormap;
+          if (cmapName && cmapName !== 'none') {
+            if (cmapName !== cachedCmapName) {
+              const stops = getColormap(cmapName);
+              const imageData = colormapToImageData(stops);
+              cachedCmapTexture = self.context.device.createTexture({
+                data: imageData.data,
+                format: 'rgba8unorm',
+                width: imageData.width,
+                height: imageData.height,
+                sampler: {
+                  minFilter: 'linear',
+                  magFilter: 'linear',
+                  addressModeU: 'clamp-to-edge',
+                  addressModeV: 'clamp-to-edge',
+                },
+              });
+              cachedCmapName = cmapName;
+            }
+            pipeline.push({
+              module: Colormap,
+              props: { colormapTexture: cachedCmapTexture },
+            });
+          }
+
+          return pipeline;
+        };
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (this as any).setState({
+          metadata,
+          forwardReproject,
+          inverseReproject,
+          images,
+          defaultGetTileData,
+          defaultRenderTile,
+        });
+      }
+    };
+  }
+
+  /**
+   * Monkey-patch COGLayer._renderSubLayers to propagate opacity to sublayers.
+   * The upstream COGLayer doesn't pass opacity to its RasterLayer/PathLayer
+   * sublayers, so opacity changes have no visual effect without this patch.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private _patchCOGLayerForOpacity(COGLayerClass: any): void {
+    if (COGLayerClass.__opacityPatched) return;
+    COGLayerClass.__opacityPatched = true;
+
+    const originalRenderSubLayers = COGLayerClass.prototype._renderSubLayers;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    COGLayerClass.prototype._renderSubLayers = function (...args: any[]) {
+      const layers = originalRenderSubLayers.apply(this, args);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const opacity = (this as any).props.opacity;
+      if (opacity === undefined || opacity === null) return layers;
+      return applyOpacity(layers, Math.max(0, Math.min(1, opacity)));
+    };
+  }
+
   private async _addLayer(): Promise<void> {
     if (!this._map || !this._state.url) {
       this._state.error = 'Please enter a COG URL.';
@@ -562,13 +944,19 @@ export class CogLayerControl implements IControl {
 
       const { COGLayer } = await import('@developmentseed/deck.gl-geotiff');
 
+      // Patch COGLayer to support floating-point GeoTIFFs and opacity
+      this._patchCOGLayerForFloat(COGLayer);
+      this._patchCOGLayerForOpacity(COGLayer);
+
       const map = this._map;
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const layerProps: Record<string, any> = {
-        id: 'cog-layer',
         geotiff: this._state.url,
         opacity: this._state.layerOpacity,
+        _rescaleMin: this._state.rescaleMin,
+        _rescaleMax: this._state.rescaleMax,
+        _colormap: this._state.colormap,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         onGeoTIFFLoad: (_geotiff: any, options: any) => {
           try {
@@ -596,16 +984,22 @@ export class CogLayerControl implements IControl {
         // geotiff-geokeys-to-proj4 not available, use default parser
       }
 
-      this._COGLayerClass = COGLayer;
-      this._cogLayerProps = layerProps;
-      this._cogLayer = new COGLayer(layerProps);
-      this._deckOverlay.setProps({ layers: [this._cogLayer] });
+      // Generate unique layer ID
+      const layerId = `cog-layer-${this._layerCounter++}`;
+      layerProps.id = layerId;
 
-      this._state.hasLayer = true;
+      this._cogLayerPropsMap.set(layerId, layerProps);
+      const newLayer = new COGLayer(layerProps);
+      this._cogLayers.set(layerId, newLayer);
+      this._deckOverlay.setProps({ layers: Array.from(this._cogLayers.values()) });
+
+      this._state.hasLayer = this._cogLayers.size > 0;
+      this._state.layerCount = this._cogLayers.size;
+      this._state.layers = this._buildLayerInfoList();
       this._state.loading = false;
       this._state.status = 'COG layer added successfully.';
       this._render();
-      this._emit('layeradd', { url: this._state.url });
+      this._emit('layeradd', { url: this._state.url, layerId });
     } catch (err) {
       this._state.loading = false;
       this._state.error = `Failed to load COG: ${err instanceof Error ? err.message : String(err)}`;
@@ -614,31 +1008,65 @@ export class CogLayerControl implements IControl {
     }
   }
 
+  private _removeLayer(id?: string): void {
+    if (id) {
+      // Remove a specific layer
+      this._cogLayers.delete(id);
+      this._cogLayerPropsMap.delete(id);
+      if (this._deckOverlay) {
+        this._deckOverlay.setProps({ layers: Array.from(this._cogLayers.values()) });
+      }
+      this._state.hasLayer = this._cogLayers.size > 0;
+      this._state.layerCount = this._cogLayers.size;
+      this._state.layers = this._buildLayerInfoList();
+      this._state.status = null;
+      this._state.error = null;
+      this._emit('layerremove', { layerId: id });
+    } else {
+      // Remove all layers (cleanup)
+      if (this._deckOverlay) {
+        this._deckOverlay.setProps({ layers: [] });
+      }
+      this._cogLayers.clear();
+      this._cogLayerPropsMap.clear();
+      this._state.hasLayer = false;
+      this._state.layerCount = 0;
+      this._state.layers = [];
+      this._state.status = null;
+      this._state.error = null;
+      this._emit('layerremove');
+    }
+  }
+
   private _updateOpacity(): void {
-    if (this._COGLayerClass && this._cogLayerProps && this._deckOverlay) {
-      this._cogLayerProps.opacity = this._state.layerOpacity;
-      this._cogLayer = new this._COGLayerClass(this._cogLayerProps);
-      this._deckOverlay.setProps({ layers: [this._cogLayer] });
+    if (!this._deckOverlay || this._cogLayers.size === 0) return;
+    const opacity = this._state.layerOpacity;
+    // deck.gl layers are immutable; clone each with the new opacity
+    for (const [id, layer] of this._cogLayers) {
+      if (typeof layer.clone === 'function') {
+        this._cogLayers.set(id, layer.clone({ opacity }));
+      }
+    }
+    this._deckOverlay.setProps({ layers: Array.from(this._cogLayers.values()) });
+    if (this._map) {
+      this._map.triggerRepaint();
     }
   }
 
-  private async _updateLayer(): Promise<void> {
-    this._removeLayer();
-    await this._addLayer();
-    if (this._state.hasLayer) {
-      this._emit('layerupdate', { url: this._state.url });
+  private _buildLayerInfoList(): CogLayerInfo[] {
+    const list: CogLayerInfo[] = [];
+    for (const [layerId, props] of this._cogLayerPropsMap) {
+      list.push({
+        id: layerId,
+        url: props.geotiff as string,
+        bands: '1', // bands are baked into COGLayer at creation
+        colormap: (props._colormap as ColormapName | 'none') || 'none',
+        rescaleMin: (props._rescaleMin as number) ?? 0,
+        rescaleMax: (props._rescaleMax as number) ?? 255,
+        nodata: undefined,
+        opacity: (props.opacity as number) ?? 1,
+      });
     }
-  }
-
-  private _removeLayer(): void {
-    if (this._cogLayer && this._deckOverlay) {
-      this._deckOverlay.setProps({ layers: [] });
-      this._cogLayer = undefined;
-      this._cogLayerProps = undefined;
-    }
-    this._state.hasLayer = false;
-    this._state.status = null;
-    this._state.error = null;
-    this._emit('layerremove');
+    return list;
   }
 }
