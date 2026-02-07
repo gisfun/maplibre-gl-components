@@ -1,6 +1,6 @@
 import "../styles/common.css";
 import "../styles/cog-layer.css";
-import type { IControl, Map as MapLibreMap } from "maplibre-gl";
+import maplibregl, { type IControl, type Map as MapLibreMap } from "maplibre-gl";
 import type {
   CogLayerControlOptions,
   CogLayerControlState,
@@ -165,6 +165,7 @@ const DEFAULT_OPTIONS: Required<CogLayerControlOptions> = {
   defaultRescaleMax: 255,
   defaultNodata: 0,
   defaultOpacity: 1,
+  defaultPickable: true,
   panelWidth: 300,
   backgroundColor: "rgba(255, 255, 255, 0.95)",
   borderRadius: 4,
@@ -220,6 +221,9 @@ export class CogLayerControl implements IControl {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private _cogLayerPropsMap: Map<string, Record<string, any>> = new Map();
   private _layerCounter = 0;
+  private _activePopup?: maplibregl.Popup;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private _mapClickHandler?: (e: any) => void;
 
   constructor(options?: CogLayerControlOptions) {
     this._options = { ...DEFAULT_OPTIONS, ...options };
@@ -233,6 +237,7 @@ export class CogLayerControl implements IControl {
       rescaleMax: this._options.defaultRescaleMax,
       nodata: this._options.defaultNodata,
       layerOpacity: this._options.defaultOpacity,
+      pickable: this._options.defaultPickable,
       hasLayer: false,
       layerCount: 0,
       layers: [],
@@ -250,6 +255,9 @@ export class CogLayerControl implements IControl {
     this._handleZoom = () => this._checkZoomVisibility();
     this._map.on("zoom", this._handleZoom);
     this._checkZoomVisibility();
+
+    // Set up map click handler for pickable COG layers
+    this._setupClickHandler();
 
     // Auto-load default URL if specified
     if (this._options.loadDefaultUrl && this._options.defaultUrl) {
@@ -274,6 +282,16 @@ export class CogLayerControl implements IControl {
     if (this._map && this._handleZoom) {
       this._map.off("zoom", this._handleZoom);
       this._handleZoom = undefined;
+    }
+
+    if (this._map && this._mapClickHandler) {
+      this._map.off("click", this._mapClickHandler);
+      this._mapClickHandler = undefined;
+    }
+
+    if (this._activePopup) {
+      this._activePopup.remove();
+      this._activePopup = undefined;
     }
 
     if (this._deckOverlay && this._map) {
@@ -673,6 +691,26 @@ export class CogLayerControl implements IControl {
     opacityGroup.appendChild(sliderRow);
     panel.appendChild(opacityGroup);
 
+    // Pickable checkbox
+    const pickableGroup = document.createElement("div");
+    pickableGroup.className = "maplibre-gl-cog-layer-form-group maplibre-gl-cog-layer-checkbox-group";
+    const pickableLabel = document.createElement("label");
+    pickableLabel.className = "maplibre-gl-cog-layer-checkbox-label";
+    const pickableCheckbox = document.createElement("input");
+    pickableCheckbox.type = "checkbox";
+    pickableCheckbox.className = "maplibre-gl-cog-layer-checkbox";
+    pickableCheckbox.checked = this._state.pickable;
+    pickableCheckbox.addEventListener("change", () => {
+      this._state.pickable = pickableCheckbox.checked;
+      this._updatePickable();
+    });
+    pickableLabel.appendChild(pickableCheckbox);
+    const pickableLabelText = document.createElement("span");
+    pickableLabelText.textContent = "Pickable (click to show pixel value)";
+    pickableLabel.appendChild(pickableLabelText);
+    pickableGroup.appendChild(pickableLabel);
+    panel.appendChild(pickableGroup);
+
     // Before ID input (for layer ordering)
     const beforeIdGroup = this._createFormGroup(
       "Before Layer ID (optional)",
@@ -818,6 +856,79 @@ export class CogLayerControl implements IControl {
     (this._map as unknown as { addControl(c: IControl): void }).addControl(
       this._deckOverlay,
     );
+  }
+
+  private _setupClickHandler(): void {
+    if (!this._map || this._mapClickHandler) return;
+    const map = this._map;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this._mapClickHandler = (e: any) => {
+      if (!this._state.pickable || this._cogLayers.size === 0) return;
+
+      // Close existing popup
+      if (this._activePopup) {
+        this._activePopup.remove();
+      }
+
+      const { lngLat } = e;
+      const layerIds = Array.from(this._cogLayers.keys());
+      const props = this._cogLayerPropsMap.get(layerIds[0]);
+
+      let html = '<div class="maplibre-gl-cog-layer-popup">';
+      html += '<table class="maplibre-gl-cog-layer-popup-table">';
+      html += `<tr><td><strong>Layers</strong></td><td>${layerIds.length} COG layer(s)</td></tr>`;
+      html += `<tr><td><strong>Lng</strong></td><td>${lngLat.lng.toFixed(6)}</td></tr>`;
+      html += `<tr><td><strong>Lat</strong></td><td>${lngLat.lat.toFixed(6)}</td></tr>`;
+      if (props) {
+        html += `<tr><td><strong>Rescale</strong></td><td>${props._rescaleMin} - ${props._rescaleMax}</td></tr>`;
+        if (props._colormap && props._colormap !== 'none') {
+          html += `<tr><td><strong>Colormap</strong></td><td>${props._colormap}</td></tr>`;
+        }
+      }
+      html += '</table>';
+      html += '</div>';
+
+      this._activePopup = new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
+        .setLngLat(lngLat)
+        .setHTML(html)
+        .addTo(map);
+
+      // Ensure popup is above deck.gl canvas
+      const popupEl = this._activePopup.getElement();
+      if (popupEl) {
+        popupEl.style.zIndex = "1000";
+      }
+    };
+    map.on("click", this._mapClickHandler);
+  }
+
+  private _updatePickable(): void {
+    if (!this._deckOverlay) return;
+    // Update all COG layers with new pickable state
+    for (const [, props] of this._cogLayerPropsMap) {
+      props.pickable = this._state.pickable;
+    }
+    this._rebuildLayers();
+  }
+
+  private async _rebuildLayers(): Promise<void> {
+    if (!this._deckOverlay) return;
+    try {
+      const { COGLayer } = await import("@developmentseed/deck.gl-geotiff");
+      this._patchCOGLayerForFloat(COGLayer);
+      this._patchCOGLayerForOpacity(COGLayer);
+
+      const newLayers = [];
+      for (const [layerId, props] of this._cogLayerPropsMap) {
+        const newLayer = new COGLayer(props);
+        this._cogLayers.set(layerId, newLayer);
+        newLayers.push(newLayer);
+      }
+      this._deckOverlay.setProps({ layers: newLayers });
+    } catch (err) {
+      console.error("Failed to rebuild layers:", err);
+    }
   }
 
   /**
@@ -1155,6 +1266,7 @@ export class CogLayerControl implements IControl {
       const layerProps: Record<string, any> = {
         geotiff: this._state.url,
         opacity: this._state.layerOpacity,
+        pickable: this._state.pickable,
         _rescaleMin: this._state.rescaleMin,
         _rescaleMax: this._state.rescaleMax,
         _colormap: this._state.colormap,
