@@ -118,6 +118,39 @@ function colormapToImageData(stops: ColorStop[]): ImageData {
 }
 
 /**
+ * Interpolate a colormap at position t (0-1) and return [R, G, B] values (0-255).
+ */
+function interpolateColormap(stops: ColorStop[], t: number): [number, number, number] {
+  const parsed = stops.map((s) => ({
+    pos: s.position,
+    rgb: parseHexColor(s.color),
+  }));
+
+  // Clamp t to [0, 1]
+  t = Math.max(0, Math.min(1, t));
+
+  // Find surrounding stops
+  let lo = parsed[0],
+    hi = parsed[parsed.length - 1];
+  for (let j = 0; j < parsed.length - 1; j++) {
+    if (t >= parsed[j].pos && t <= parsed[j + 1].pos) {
+      lo = parsed[j];
+      hi = parsed[j + 1];
+      break;
+    }
+  }
+
+  const range = hi.pos - lo.pos;
+  const f = range > 0 ? (t - lo.pos) / range : 0;
+
+  return [
+    Math.round(lo.rgb[0] + (hi.rgb[0] - lo.rgb[0]) * f),
+    Math.round(lo.rgb[1] + (hi.rgb[1] - lo.rgb[1]) * f),
+    Math.round(lo.rgb[2] + (hi.rgb[2] - lo.rgb[2]) * f),
+  ];
+}
+
+/**
  * All available colormap names.
  */
 const COLORMAP_NAMES: ColormapName[] = [
@@ -915,7 +948,9 @@ export class StacLayerControl implements IControl {
         throw new Error(`Failed to fetch: ${response.status} ${response.statusText}`);
       }
 
-      const stacItem = await response.json();
+      // Get raw text first to preserve asset key order from JSON source
+      const rawText = await response.text();
+      const stacItem = JSON.parse(rawText);
 
       // Validate it's a STAC item
       if (stacItem.type !== "Feature" || !stacItem.assets) {
@@ -924,9 +959,28 @@ export class StacLayerControl implements IControl {
 
       this._state.stacItem = stacItem;
 
-      // Extract COG assets
+      // Extract asset keys in original JSON order using regex
+      // This preserves the order as it appears in the source JSON
+      const assetKeysInOrder: string[] = [];
+      const assetsMatch = rawText.match(/"assets"\s*:\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/);
+      if (assetsMatch) {
+        const assetsBlock = assetsMatch[1];
+        const keyMatches = assetsBlock.matchAll(/"([^"]+)"\s*:\s*\{/g);
+        for (const match of keyMatches) {
+          assetKeysInOrder.push(match[1]);
+        }
+      }
+
+      // Fall back to Object.keys if regex didn't work
+      const keysToIterate = assetKeysInOrder.length > 0
+        ? assetKeysInOrder
+        : Object.keys(stacItem.assets);
+
+      // Extract COG assets in original order
       const assets: StacAssetInfo[] = [];
-      for (const [key, asset] of Object.entries(stacItem.assets)) {
+      for (const key of keysToIterate) {
+        const asset = stacItem.assets[key];
+        if (!asset) continue;
         const assetObj = asset as {
           href: string;
           type?: string;
@@ -939,6 +993,11 @@ export class StacLayerControl implements IControl {
             scale?: number;
             offset?: number;
           }>;
+          "eo:bands"?: Array<{
+            name?: string;
+            common_name?: string;
+            center_wavelength?: number;
+          }>;
         };
         // Filter for COG/GeoTIFF assets
         if (
@@ -949,6 +1008,8 @@ export class StacLayerControl implements IControl {
         ) {
           // Extract raster:bands metadata if available
           const rasterBand = assetObj["raster:bands"]?.[0];
+          // Extract eo:bands metadata for wavelength-based sorting
+          const eoBand = assetObj["eo:bands"]?.[0];
           assets.push({
             key,
             href: assetObj.href,
@@ -958,9 +1019,26 @@ export class StacLayerControl implements IControl {
             nodata: rasterBand?.nodata ?? assetObj.nodata,
             scale: rasterBand?.scale,
             offset: rasterBand?.offset,
+            centerWavelength: eoBand?.center_wavelength,
+            commonName: eoBand?.common_name,
           });
         }
       }
+
+      // Sort assets by center wavelength (spectral order) if available
+      // Assets without wavelength go to the end
+      assets.sort((a, b) => {
+        // Both have wavelength - sort by wavelength
+        if (a.centerWavelength !== undefined && b.centerWavelength !== undefined) {
+          return a.centerWavelength - b.centerWavelength;
+        }
+        // Only a has wavelength - a comes first
+        if (a.centerWavelength !== undefined) return -1;
+        // Only b has wavelength - b comes first
+        if (b.centerWavelength !== undefined) return 1;
+        // Neither has wavelength - keep original order (by key)
+        return 0;
+      });
 
       this._state.assets = assets;
       this._state.loading = false;
@@ -1207,7 +1285,6 @@ export class StacLayerControl implements IControl {
           layers: Array.from(this._cogLayers.values()),
         });
 
-        console.log(`STAC RGB layer added: ${r},${g},${b} id: ${layerId}`);
 
         // Fit to bounds if available
         if (this._state.stacItem?.bbox) {
@@ -1272,11 +1349,6 @@ export class StacLayerControl implements IControl {
         _rescaleMin: this._state.rescaleMin,
         _rescaleMax: this._state.rescaleMax,
         _colormap: this._state.colormap,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        onGeoTIFFLoad: (geotiff: any, opts: any) => {
-          console.log(`STAC GeoTIFF loaded:`, geotiff, opts);
-          console.log(`STAC geographic bounds:`, opts.geographicBounds);
-        },
       };
 
       // Add custom geoKeysParser for better projection support
@@ -1285,20 +1357,16 @@ export class StacLayerControl implements IControl {
         layerProps.geoKeysParser = geoKeysParser;
       }
 
-      console.log(`STAC single-band layer props:`, layerProps);
       this._cogLayerPropsMap.set(layerId, layerProps);
       const newLayer = new COGLayer(layerProps);
-      console.log(`STAC single-band layer created:`, newLayer);
       this._cogLayers.set(layerId, newLayer);
       this._deckOverlay.setProps({
         layers: Array.from(this._cogLayers.values()),
       });
-      console.log(`STAC overlay updated with ${this._cogLayers.size} layers`);
 
       // Fit to bounds if available
       if (this._state.stacItem?.bbox) {
         const [west, south, east, north] = this._state.stacItem.bbox;
-        console.log(`STAC fitting to bbox:`, [west, south, east, north]);
         this._map.fitBounds(
           [
             [west, south],
@@ -1313,7 +1381,6 @@ export class StacLayerControl implements IControl {
       this._state.loading = false;
       this._state.status = `Added layer: ${asset.title || asset.key}`;
       this._render();
-      console.log(`STAC layer added successfully: ${layerId}`);
       this._emit("layeradd", { layerId, assetKey: asset.key, url: asset.href });
     } catch (err) {
       this._state.loading = false;
@@ -1525,6 +1592,13 @@ export class StacLayerControl implements IControl {
             const rgba = new Uint8ClampedArray(pixelCount * 4);
             const range = rescaleMax - rescaleMin;
 
+            // Check if a colormap is selected - apply it directly to preserve nodata transparency
+            const cmapName = selfForTile.props._colormap;
+            let colormapStops: ColorStop[] | null = null;
+            if (cmapName && cmapName !== "none") {
+              colormapStops = getColormap(cmapName);
+            }
+
             for (let i = 0; i < pixelCount; i++) {
               const rawVal = rasterData[i];
               // Handle nodata (typically 0 for Sentinel-2)
@@ -1532,14 +1606,26 @@ export class StacLayerControl implements IControl {
                 rgba[i * 4] = 0;
                 rgba[i * 4 + 1] = 0;
                 rgba[i * 4 + 2] = 0;
-                rgba[i * 4 + 3] = 0; // Transparent
+                rgba[i * 4 + 3] = 0; // Transparent - preserved even with colormap
               } else {
-                // Rescale to 0-255
-                const normalized = Math.max(0, Math.min(255, ((rawVal - rescaleMin) / range) * 255));
-                rgba[i * 4] = normalized;
-                rgba[i * 4 + 1] = normalized;
-                rgba[i * 4 + 2] = normalized;
-                rgba[i * 4 + 3] = 255;
+                // Rescale to 0-1 range for colormap lookup, or 0-255 for grayscale
+                const normalizedFloat = Math.max(0, Math.min(1, (rawVal - rescaleMin) / range));
+
+                if (colormapStops) {
+                  // Apply colormap - interpolate between stops
+                  const color = interpolateColormap(colormapStops, normalizedFloat);
+                  rgba[i * 4] = color[0];
+                  rgba[i * 4 + 1] = color[1];
+                  rgba[i * 4 + 2] = color[2];
+                  rgba[i * 4 + 3] = 255;
+                } else {
+                  // Grayscale
+                  const gray = Math.round(normalizedFloat * 255);
+                  rgba[i * 4] = gray;
+                  rgba[i * 4 + 1] = gray;
+                  rgba[i * 4 + 2] = gray;
+                  rgba[i * 4 + 3] = 255;
+                }
               }
             }
 
@@ -1556,17 +1642,29 @@ export class StacLayerControl implements IControl {
               height: rasterData.height,
               width: rasterData.width,
               _preRescaled: true, // Flag that rescaling was done in getTileData
+              _colormapApplied: !!colormapStops, // Flag that colormap was applied in getTileData
             };
           }
 
-          // For 3-band data, expand to RGBA
+          // For 3-band data, expand to RGBA with nodata handling
           if (SamplesPerPixel === 3) {
             const rgba = new Uint8ClampedArray(pixelCount * 4);
             for (let i = 0; i < pixelCount; i++) {
-              rgba[i * 4] = rasterData[i * 3];
-              rgba[i * 4 + 1] = rasterData[i * 3 + 1];
-              rgba[i * 4 + 2] = rasterData[i * 3 + 2];
-              rgba[i * 4 + 3] = 255;
+              const r = rasterData[i * 3];
+              const g = rasterData[i * 3 + 1];
+              const b = rasterData[i * 3 + 2];
+              // Handle nodata: if all bands are 0, treat as transparent
+              if (r === 0 && g === 0 && b === 0) {
+                rgba[i * 4] = 0;
+                rgba[i * 4 + 1] = 0;
+                rgba[i * 4 + 2] = 0;
+                rgba[i * 4 + 3] = 0; // Transparent
+              } else {
+                rgba[i * 4] = r;
+                rgba[i * 4 + 1] = g;
+                rgba[i * 4 + 2] = b;
+                rgba[i * 4 + 3] = 255;
+              }
             }
 
             const tex = device.createTexture({
@@ -1648,8 +1746,9 @@ export class StacLayerControl implements IControl {
           }
 
           // Apply colormap if selected (works on normalized 0-1 data)
+          // Skip if colormap was already applied in getTileData (for uint16 data with nodata preservation)
           const cmapName = self.props._colormap;
-          if (cmapName && cmapName !== "none") {
+          if (cmapName && cmapName !== "none" && !tileData._colormapApplied) {
             if (cmapName !== cachedCmapName) {
               const stops = getColormap(cmapName);
               const imageData = colormapToImageData(stops);
@@ -1728,9 +1827,7 @@ export class StacLayerControl implements IControl {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return async (geoKeys: any) => {
         try {
-          console.log("STAC geoKeysParser called with:", geoKeys);
           const result = geoKeysToProj4.toProj4(geoKeys);
-          console.log("STAC geoKeysToProj4 result:", result);
 
           if (result && result.proj4) {
             // Remove axis parameter which can cause issues with some projections
@@ -1738,7 +1835,6 @@ export class StacLayerControl implements IControl {
             // confuse coordinate transformations
             let proj4Str = result.proj4 as string;
             proj4Str = proj4Str.replace(/\+axis=\w+\s*/g, "");
-            console.log("STAC cleaned proj4 string:", proj4Str);
 
             let parsed: Record<string, unknown> = {};
             if (typeof proj4Fn === "function") {
@@ -1749,7 +1845,6 @@ export class StacLayerControl implements IControl {
                     string,
                     unknown
                   >) || {};
-                console.log("STAC proj4 parsed definition:", parsed);
               } catch (e) {
                 console.error("STAC proj4 parsing error:", e);
               }
