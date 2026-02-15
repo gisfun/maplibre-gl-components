@@ -21,6 +21,9 @@ export const ALL_DEFAULT_CONTROLS: readonly DefaultControlName[] = [
   "print",
   "minimap",
   "swipe",
+  "colorbarGui",
+  "legendGui",
+  "htmlGui",
   "streetView",
   "addVector",
   "cogLayer",
@@ -31,7 +34,7 @@ export const ALL_DEFAULT_CONTROLS: readonly DefaultControlName[] = [
   "planetaryComputer",
   "gaussianSplat",
   "lidar",
-  "usgsLidar",
+  "usgsLidar"
 ] as const;
 
 /**
