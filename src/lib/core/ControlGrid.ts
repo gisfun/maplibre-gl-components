@@ -45,11 +45,13 @@ import {
   PlanetaryComputerControl,
   PlanetaryComputerLayerAdapter,
 } from "maplibre-gl-planetary-computer";
-// import type {
+// import {
 //   GaussianSplatControl,
 //   GaussianSplatLayerAdapter,
 // } from "maplibre-gl-splat";
+import { GaussianSplatControl, GaussianSplatLayerAdapter } from "./GaussianSplatControl";
 // import { StreetViewControl } from "maplibre-gl-streetview";
+import { StreetViewControl } from "./StreetViewControl";
 import { SwipeControl } from "maplibre-gl-swipe";
 import {
   UsgsLidarControl,
@@ -452,7 +454,6 @@ export class ControlGrid implements IControl {
           collapsed: true,
           maxHeight: 500,
         }) as unknown as IControl;
-      /*
       case "gaussianSplat":
         return new GaussianSplatControl({
           collapsed: true,
@@ -488,7 +489,6 @@ export class ControlGrid implements IControl {
           ...this._options.streetViewOptions,
         }) as unknown as IControl;
       }
-      */
       case "swipe":
         return new SwipeControl({
           collapsed: true,
@@ -680,8 +680,8 @@ export class ControlGrid implements IControl {
         adapters.push(new LidarLayerAdapter(ctrl));
       } else if (ctrl instanceof PlanetaryComputerControl) {
         adapters.push(new PlanetaryComputerLayerAdapter(ctrl));
-      // } else if (ctrl instanceof GaussianSplatControl) {
-      //   adapters.push(new GaussianSplatLayerAdapter(ctrl));
+      } else if (ctrl instanceof GaussianSplatControl) {
+        adapters.push(new GaussianSplatLayerAdapter(ctrl));
       } else if (ctrl instanceof UsgsLidarControl) {
         adapters.push(new UsgsLidarLayerAdapter(ctrl));
       } else if (ctrl instanceof GeoEditor) {
