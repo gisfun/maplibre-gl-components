@@ -42,7 +42,7 @@ export default defineConfig({
     rollupOptions: {
       // External packages that should not be bundled
       // shpjs and @duckdb/duckdb-wasm are optional dependencies loaded at runtime
-      external: ['react', 'react-dom', 'maplibre-gl', 'shpjs', '@duckdb/duckdb-wasm', 'jspdf'],
+      external: ['react', 'react-dom', 'maplibre-gl', 'shpjs', '@duckdb/duckdb-wasm', 'jspdf', 'three'],
       onwarn(warning, defaultHandler) {
         // Suppress "spawn" not exported warning from @loaders.gl/worker-utils
         // (it imports Node.js child_process which doesn't exist in browser builds)
