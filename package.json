@@ -1,5 +1,5 @@
 {
-  "name": "maplibre-gl-components",
+  "name": "@gisfun/maplibre-gl-components",
   "version": "0.15.0",
   "description": "Legend, colorbar, and HTML control components for MapLibre GL JS maps",
   "type": "module",
