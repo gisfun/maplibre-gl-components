@@ -11,10 +11,6 @@ on:
         default: '0.15.0-alpha.0'
 
 permissions:
-  id-token: write # Required for provenance and OIDC
-  contents: read  # Required to checkout code
-
-permissions:
   id-token: write # Required for OIDC and provenance
   contents: read  # Required to checkout the code
 
@@ -42,13 +38,6 @@ jobs:
 
       - name: Build
         run: npm run build
-
-      - name: Publish to npm
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            npm publish --tag alpha --access public
-          else
-            npm publish --access public
 
       # Publishes with provenance. OIDC handles authentication automatically.
       # Note: --access public is mandatory for first-time scoped packages.
