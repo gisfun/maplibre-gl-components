@@ -48,6 +48,11 @@ export default defineConfig({
           return true;
         }
 
+        // This catches @deck.gl/core, @deck.gl/mapbox, @luma.gl/core, etc.
+        if (id.startsWith('@deck.gl/') || id.startsWith('@luma.gl/')) {
+          return true;
+        }
+
         const packages = ['react', 'react-dom', 'maplibre-gl', 'maplibre-gl-splat', 'maplibre-gl-streetview', 'shpjs', '@duckdb/duckdb-wasm', 'jspdf'];
         return packages.some(pkg => id === pkg || id.startsWith(`${pkg}/`)); 
       },
